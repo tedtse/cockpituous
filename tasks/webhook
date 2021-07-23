@@ -1,0 +1,195 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import logging
+import subprocess
+import shutil
+import http.server
+import json
+import contextlib
+import ssl
+
+import pika
+
+import github_handler
+
+# Reduce pika noise
+logging.getLogger("pika").propagate = False
+
+HOME_DIR = '/tmp/home'
+WEBHOOK_SECRETS = '/run/secrets/webhook'
+AMQP_SERVER = None  # initialized in setup()
+COCKPIT_BOTS_REPO = os.getenv('COCKPIT_BOTS_REPO', 'https://github.com/cockpit-project/bots')
+COCKPIT_BOTS_BRANCH = os.getenv('COCKPIT_BOTS_BRANCH', 'main')
+BOTS_CHECKOUT = HOME_DIR + '/bots'
+sys.path.append(BOTS_CHECKOUT)
+
+PASSWD_ENTRY_SCRIPT = '''
+set -ex
+if ! whoami && [ -w /etc/passwd ]; then
+    echo "user:x:$(id -u):0:random uid:${HOME:-/home/user}:/sbin/nologin" >> /etc/passwd
+fi
+'''
+
+
+def setup():
+    '''Prepare temporary home directory from secrets'''
+    global AMQP_SERVER
+
+    if os.path.isdir(HOME_DIR):
+        return
+    logging.debug('Initializing %s', HOME_DIR)
+    os.makedirs(HOME_DIR)
+
+    # install credentials from secrets volume; copy to avoid world-readable files
+    # (which e. g. ssh complains about), and to make them owned by our random UID.
+    old_umask = os.umask(0o77)
+    for f in os.listdir(WEBHOOK_SECRETS):
+        if f.startswith('..'):
+            continue  # secrets volume internal files
+        src = os.path.join(WEBHOOK_SECRETS, f)
+        if os.path.isdir(src):
+            continue  # happens with real directory instead of k8s secrets volumes
+        dest = os.path.join(HOME_DIR, f.replace('--', '/'))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(src, dest)
+    os.umask(old_umask)
+
+    ensure_bots_checkout()
+    from lib import testmap
+    from task.distributed_queue import DEFAULT_AMQP_SERVER
+    AMQP_SERVER = os.getenv('AMQP_SERVER', DEFAULT_AMQP_SERVER)
+
+    for project in testmap.projects():
+        subprocess.check_call([os.path.join(BOTS_CHECKOUT, 'tests-scan'), '--amqp',
+                               AMQP_SERVER, '--repo', project],
+                              cwd=BOTS_CHECKOUT)
+        subprocess.check_call([os.path.join(BOTS_CHECKOUT, 'issue-scan'), '--amqp',
+                               AMQP_SERVER, '--repo', project],
+                              cwd=BOTS_CHECKOUT)
+
+
+def ensure_bots_checkout():
+    if not os.path.isdir(BOTS_CHECKOUT):
+        subprocess.check_call(['git', 'clone', COCKPIT_BOTS_REPO, BOTS_CHECKOUT])
+    subprocess.check_call(['git', '-C', BOTS_CHECKOUT, 'fetch', 'origin'])
+    subprocess.check_call(['git', '-C', BOTS_CHECKOUT, 'reset', '--hard'])
+    subprocess.check_call(['git', '-C', BOTS_CHECKOUT, 'clean', '-dxff'])
+    subprocess.check_call(['git', '-C', BOTS_CHECKOUT, 'checkout', 'origin/' + COCKPIT_BOTS_BRANCH])
+
+
+@contextlib.contextmanager
+def distributed_queue(amqp_server):
+    try:
+        host, port = amqp_server.split(':')
+    except ValueError:
+        logging.error('Please format amqp_server as host:port')
+        sys.exit(1)
+
+    context = ssl.create_default_context(cafile='/run/secrets/webhook/ca.pem')
+    context.load_cert_chain(keyfile='/run/secrets/webhook/amqp-client.key',
+                            certfile='/run/secrets/webhook/amqp-client.pem')
+    context.check_hostname = False
+    connection = pika.BlockingConnection(pika.ConnectionParameters(
+        host=host,
+        port=int(port),
+        ssl_options=pika.SSLOptions(context, server_hostname=host),
+        credentials=pika.credentials.ExternalCredentials()))
+    channel = connection.channel()
+
+    channel.queue_declare(queue='webhook', auto_delete=False)
+    yield channel
+    connection.close()
+
+
+def publish_to_queue(routing_key, event, request):
+    body = {
+        'event': event,
+        'request': request,
+    }
+    with distributed_queue(AMQP_SERVER) as queue:
+        queue.basic_publish('', routing_key, json.dumps(body),
+                            properties=pika.BasicProperties(content_type='application/json'))
+
+
+class ReleaseHandler(github_handler.GithubHandler):
+    def handle_event(self, event, request):
+        logging.info('Handling %s event', event)
+        if event == 'pull_request':
+            return self.handle_pull_request_event(event, request)
+        elif event == 'status':
+            return self.handle_status_event(event, request)
+        elif event == 'issues':
+            return self.handle_issues_event(event, request)
+        return (501, 'unsupported event ' + event)
+
+    def handle_pull_request_event(self, event, request):
+        repo = request['pull_request']['base']['repo']['full_name']
+        title = request['pull_request']['title']
+        number = int(request['number'])
+        action = request['action']
+        merged = request['pull_request'].get('merged', False)
+
+        logging.info('repo: %s; title: %s; number: %d; action: %s', repo, title, number, action)
+        # see https://developer.github.com/v3/activity/events/types/#pullrequestevent for all actions
+        if action == 'closed' and merged:
+            logging.info("pull request was merged, ensuring cockpit checkout is latest main")
+            ensure_bots_checkout()
+        elif action not in ['opened', 'synchronize', 'edited', 'labeled']:
+            logging.info("action %s unknown, skipping pull request event" % action)
+            return None
+
+        publish_to_queue('webhook', event, request)
+        return None
+
+    def handle_status_event(self, event, request):
+        repo = request['repository']['full_name']
+        sha = request['sha']
+        state = request['state']
+        description = request.get('description', '')
+        if state != 'pending':
+            return None
+        # only allow manually triggered tests
+        logging.info('repo: %s; sha: %s; state: %s; description: %s', repo, sha, state, description)
+        if not description.rstrip().endswith('(direct trigger)'):
+            logging.info("Status description doesn't end with '(direct trigger)', skipping testing")
+            return None
+
+        publish_to_queue('webhook', event, request)
+        return None
+
+    def handle_issues_event(self, event, request):
+        action = request['action']
+        if event == 'issues' and action not in ['opened', 'edited', 'labeled']:
+            logging.info("action %s unknown, skipping issues event" % action)
+            return None
+
+        publish_to_queue('webhook', event, request)
+        return None
+
+    def do_GET(self):
+        if self.path == '/inspect-queue':
+            self.wfile.write(b'HTTP/1.1 200\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n')
+            try:
+                subprocess.check_call([f'{BOTS_CHECKOUT}/inspect-queue'], stdout=self.wfile)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                self.wfile.write(b'Failed: ' + bytes(str(e), 'utf-8'))
+        else:
+            self.wfile.write(b'HTTP/1.1 404\r\n\r\nNot found')
+
+
+#
+# main
+#
+
+logging.basicConfig(level=logging.DEBUG)  # INFO
+
+# ensure we have a passwd entry for random UIDs
+# https://docs.openshift.com/container-platform/3.7/creating_images/guidelines.html
+subprocess.check_call(PASSWD_ENTRY_SCRIPT, shell=True)
+
+os.environ['HOME'] = HOME_DIR
+
+setup()
+http.server.HTTPServer(('', 8080), ReleaseHandler).serve_forever()

@@ -1,0 +1,91 @@
+#!/bin/sh
+
+set -eux
+
+COCKPIT_BOTS_REPO=${COCKPIT_BOTS_REPO:-https://github.com/cockpit-project/bots}
+COCKPIT_BOTS_BRANCH=${COCKPIT_BOTS_BRANCH:-main}
+
+# ensure we have a passwd entry for random UIDs
+# https://docs.openshift.com/container-platform/3.7/creating_images/guidelines.html
+if ! whoami && [ -w /etc/passwd ]; then
+    echo "user:x:$(id -u):0:random uid:/work:/sbin/nologin" >> /etc/passwd
+    export HOME=/work
+fi
+
+# set up custom NPM registry
+if [ -n "${NPM_REGISTRY:-}" ]; then
+    npm config set registry "$NPM_REGISTRY"
+    echo "Set NPM registry to $NPM_REGISTRY"
+fi
+if [ -r /secrets/npm-registry.crt ]; then
+    export NODE_EXTRA_CA_CERTS=/secrets/npm-registry.crt
+fi
+
+# set up S3 keys for OpenShift secrets volume
+if [ ! -d /secrets/s3-keys ]; then
+    # then our container symlink will point into the void, replace it with a directory and set up all files that we can find
+    rm ~/.config/cockpit-dev/s3-keys
+    mkdir ~/.config/cockpit-dev/s3-keys
+    for f in /secrets/s3-keys--*; do
+        [ -e "$f" ] || continue # non-matching glob
+        ln -s "$f" ~/.config/cockpit-dev/s3-keys/"${f#*--}"
+    done
+fi
+
+# let's just do our work in the current directory
+WORKDIR="$PWD"
+BOTS_DIR="$WORKDIR"/bots
+
+# Set up github user and token
+git config --global credential.helper store
+echo "https://cockpituous:$(cat ~/.config/github-token)@github.com" > ~/.git-credentials
+
+echo "Starting testing"
+
+function update_bots() {
+    if [ -d "$BOTS_DIR" ]; then
+        git -C "$BOTS_DIR" pull --rebase
+    else
+        git clone --quiet -b "$COCKPIT_BOTS_BRANCH" "$COCKPIT_BOTS_REPO" "$BOTS_DIR"
+    fi
+}
+
+# wait between 1 and 10 minutes, but not in an interactive terminal (annoying for debugging)
+function slumber() {
+    if [ -t 0 ]; then
+        sleep 10
+    else
+        sleep $(shuf -i ${1:-60-600} -n 1)
+    fi
+}
+
+# on mass deployment, avoid GitHub stampede
+slumber 0-120
+
+# Consume from queue 30 times, then restart; listen to SIGTERM for orderly shutdown
+shutdown=
+trap "echo 'received SIGTERM, stopping main loop'; shutdown=1" TERM
+
+for i in $(seq 1 30); do
+    [ -z "$shutdown" ] || break
+    update_bots
+    cd "$BOTS_DIR"
+
+    # avoid stale state and sockets
+    virsh list --id --all | xargs --no-run-if-empty virsh destroy
+    pkill libvirtd || true
+
+    # run-queue fails on empty queues; don't poll too often
+    timeout 12h ./run-queue ${AMQP_SERVER:+--amqp} ${AMQP_SERVER:-} || slumber
+    # clean up after tests, in particular large qcow overlays
+    rm -rf /tmp/* || true
+done
+
+# Prune old images
+update_bots
+./image-prune
+
+# Clean up S3
+for region in eu-central-1 us-east-1; do
+    ./image-prune --s3 "https://cockpit-images.${region}.linodeobjects.com/" || true
+done

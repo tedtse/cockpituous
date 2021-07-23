@@ -1,0 +1,62 @@
+name: tests
+on: [pull_request]
+jobs:
+  unit-tests:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make python3-pyflakes python3-pep8
+
+      - name: Run unit tests
+        run: make check
+
+  tasks:
+    runs-on: ubuntu-20.04
+    permissions:
+      # enough permissions for tests-scan to work
+      pull-requests: read
+      statuses: write
+    timeout-minutes: 30
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v2
+        with:
+          # need this to get origin/main for git diff
+          fetch-depth: 0
+
+      - name: Rebase to current main
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git rebase origin/main
+
+      - name: Check which containers changed
+        id: containers_changed
+        run: |
+          tasks=$(git diff --name-only origin/main..HEAD -- tasks/ | grep -v run-local.sh || true)
+          images=$(git diff --name-only origin/main..HEAD -- images/)
+          # print for debugging
+          echo "tasks: $tasks"
+          echo "images: $images"
+          [ -z "$tasks" ] || echo "::set-output name=tasks::true"
+          [ -z "$images" ] || echo "::set-output name=images::true"
+
+      - name: Build tasks container if it changed
+        if: steps.containers_changed.outputs.tasks
+        # Run podman as root, as podman is missing slirp4netns by default, and does not have overlayfs by default
+        run: sudo make tasks-container
+
+      - name: Build images container if it changed
+        if: steps.containers_changed.outputs.images
+        run: sudo make images-container
+
+      - name: Test local deployment
+        run: |
+          echo '${{ secrets.GITHUB_TOKEN }}' > ~/.config/github-token
+          PRN=$(echo "$GITHUB_REF" | cut -f3 -d '/')
+          sudo tasks/run-local.sh -p $PRN -t ~/.config/github-token

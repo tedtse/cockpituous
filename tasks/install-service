@@ -1,0 +1,70 @@
+#!/bin/sh
+
+set -eufx
+
+SECRETS=/var/lib/cockpit-secrets
+CACHE=/var/cache/cockpit-tasks
+INSTANCES=${INSTANCES:-3}
+TMPFS_GB=14
+
+systemctl stop 'cockpit-tasks@*.service'
+
+# if the host has plenty of RAM, use a tmpfs for /tmp for getting less IO contention;
+# note the *2 as the containers also need actual RAM for themselves
+if awk "/MemAvailable:/ { exit (\$2 > ${TMPFS_GB}*1048576*2*${INSTANCES}) ? 0 : 1  }" /proc/meminfo; then
+    TMPVOL="--tmpfs /tmp:size=${TMPFS_GB}g"
+fi
+
+if RUNC=$(which podman 2>/dev/null); then
+    UNIT_DEPS=''
+    DEVICES="--device=/dev/kvm"
+    NETWORK='--net=slirp4netns'  # isolate containers from each other
+    NETWORK_SETUP=''
+    NETWORK_TEARDOWN=''
+else
+    RUNC=$(which docker)
+    # rely on oci-kvm-hook for /dev/kvm; but avoid stat failure on Fedora ≥ 33 guests on RHEL 7
+    DEVICES='--security-opt=seccomp=unconfined'
+    NETWORK='--network=cockpit-tasks-%i'
+    NETWORK_SETUP="ExecStartPre=-$RUNC network rm cockpit-tasks-%i
+ExecStartPre=$RUNC network create --driver bridge cockpit-tasks-%i"
+    NETWORK_TEARDOWN="ExecStop=$RUNC network rm cockpit-tasks-%i"
+    UNIT_DEPS="Requires=docker.service
+After=docker.service"
+fi
+
+mkdir -p $SECRETS/tasks $SECRETS/webhook $CACHE
+chown -R 1111:1111 $SECRETS $CACHE
+chcon -R -t container_file_t $SECRETS $CACHE
+
+cat <<EOF > /etc/systemd/system/cockpit-tasks@.service
+[Unit]
+Description=Cockpit Tasks %i
+$UNIT_DEPS
+
+[Service]
+Environment="TEST_JOBS=${TEST_JOBS:-5}"
+Environment="TEST_CACHE=$CACHE"
+Environment="TEST_SECRETS=$SECRETS"
+Environment="TEST_PUBLISH=${TEST_PUBLISH:-sink}"
+Environment="TEST_NOTIFICATION_MX=${TEST_NOTIFICATION_MX:-}"
+Environment="TEST_NOTIFICATION_TO=${TEST_NOTIFICATION_TO:-}"
+Environment="NPM_REGISTRY=${NPM_REGISTRY:-}"
+Restart=always
+RestartSec=60
+# give image pull enough time
+TimeoutStartSec=10min
+ExecStartPre=-$RUNC rm -f cockpit-tasks-%i
+ExecStartPre=/usr/bin/flock /tmp/cockpit-image-pull $RUNC pull quay.io/cockpit/tasks
+$NETWORK_SETUP
+ExecStart=$RUNC run --name=cockpit-tasks-%i --hostname=%i-%H $DEVICES $NETWORK --storage-opt size=50G --memory=24g --volume=\${TEST_CACHE}/images:/cache/images:rw --volume=\${TEST_SECRETS}/tasks:/secrets:ro --volume=\${TEST_SECRETS}/webhook:/run/secrets/webhook:ro ${TMPVOL:-} --shm-size=1024m --user=1111 --env=NPM_REGISTRY=\${NPM_REGISTRY} --env=TEST_JOBS=\${TEST_JOBS} --env=TEST_PUBLISH=\${TEST_PUBLISH} --env=TEST_NOTIFICATION_MX=\${TEST_NOTIFICATION_MX} --env=TEST_NOTIFICATION_TO=\${TEST_NOTIFICATION_TO} quay.io/cockpit/tasks
+ExecStop=$RUNC rm -f cockpit-tasks-%i
+$NETWORK_TEARDOWN
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+for i in `seq $INSTANCES`; do systemctl enable --now cockpit-tasks@$i; done
